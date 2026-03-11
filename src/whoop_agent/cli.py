@@ -237,6 +237,52 @@ def track(token, days):
     click.echo(f"Chart saved: {path}")
 
 
+@volume.command()
+@click.option("--days", default=30, help="Number of days to backfill (default: 30)")
+@click.option("--limit", default=15, help="Number of top tokens to include (default: 15)")
+def backfill(days, limit):
+    """Backfill historical volume data from CoinGecko.
+
+    Fetches past daily volume/price/mcap for top AI agent tokens
+    and stores them locally, so you can immediately generate charts
+    and view trends without waiting days for data to accumulate.
+    """
+    vs = load_volume_settings()
+
+    click.echo(f"Backfilling {days} days of history for top {limit} AI agent tokens...")
+    click.echo("This may take a while due to API rate limits.")
+    click.echo()
+
+    def on_progress(name, idx, total):
+        click.echo(f"  [{idx}/{total}] Fetching history for {name}...")
+
+    snapshots = volume_data.backfill_snapshots(
+        api_key=vs.coingecko_api_key,
+        days=days,
+        limit=limit,
+        progress_callback=on_progress,
+    )
+
+    if not snapshots:
+        click.echo("No historical data returned.")
+        return
+
+    conn = volume_store.init_db(vs.volume_db_path)
+    try:
+        for snap in snapshots:
+            volume_store.save_snapshot(conn, snap)
+    finally:
+        conn.close()
+
+    click.echo()
+    click.echo(f"Saved {len(snapshots)} daily snapshots ({snapshots[0]['date']} to {snapshots[-1]['date']})")
+    click.echo(f"Each snapshot contains {limit} tokens.")
+    click.echo()
+    click.echo("You can now run:")
+    click.echo("  whoop-agent volume chart    — generate charts")
+    click.echo("  whoop-agent volume changes  — view daily changes")
+
+
 @volume.command(name="list")
 def list_tokens():
     """List all tracked AI agent tokens from local database."""
