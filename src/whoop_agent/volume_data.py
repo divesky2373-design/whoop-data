@@ -11,8 +11,9 @@ COINGECKO_PRO_BASE = "https://pro-api.coingecko.com/api/v3"
 # CoinGecko category for AI agent tokens
 AI_AGENT_CATEGORY = "artificial-intelligence"
 
-# Rate limit: ~1.5s between requests for free tier
-_RATE_LIMIT_DELAY = 1.5
+# Rate limit delay between requests (seconds).
+# CoinGecko free tier: ~10-30 calls/min, stricter on market_chart.
+_RATE_LIMIT_DELAY = 6.0
 
 
 class CoinGeckoClient:
@@ -29,14 +30,27 @@ class CoinGeckoClient:
         self._last_request = 0.0
 
     def _get(self, endpoint: str, params: dict | None = None) -> dict | list:
-        """Make a rate-limited GET request."""
-        elapsed = time.time() - self._last_request
-        if elapsed < _RATE_LIMIT_DELAY:
-            time.sleep(_RATE_LIMIT_DELAY - elapsed)
-
+        """Make a rate-limited GET request with retry on 429."""
         url = f"{self.base_url}{endpoint}"
-        resp = self.session.get(url, params=params, timeout=30)
-        self._last_request = time.time()
+
+        for attempt in range(5):
+            elapsed = time.time() - self._last_request
+            delay = _RATE_LIMIT_DELAY if self.api_key else _RATE_LIMIT_DELAY
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+
+            resp = self.session.get(url, params=params, timeout=30)
+            self._last_request = time.time()
+
+            if resp.status_code == 429:
+                wait = (2 ** attempt) * 10  # 10s, 20s, 40s, 80s, 160s
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        # Final attempt failed
         resp.raise_for_status()
         return resp.json()
 
