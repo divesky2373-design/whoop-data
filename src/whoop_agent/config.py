@@ -18,6 +18,15 @@ class Settings:
     token_path: str = str(Path.home() / ".whoop_tokens.json")
 
 
+@dataclass
+class VolumeSettings:
+    """Settings for the AI agent trading volume monitor."""
+
+    coingecko_api_key: str | None = None
+    volume_db_path: str = str(Path.home() / ".whoop_agent_volume.db")
+    chart_output_dir: str = "./charts"
+
+
 def load_settings() -> Settings:
     """Load settings from .env file and environment variables.
 
@@ -45,4 +54,17 @@ def load_settings() -> Settings:
         token_path=os.getenv(
             "WHOOP_TOKEN_PATH", str(Path.home() / ".whoop_tokens.json")
         ),
+    )
+
+
+def load_volume_settings() -> VolumeSettings:
+    """Load volume monitor settings. No required env vars."""
+    load_dotenv()
+
+    return VolumeSettings(
+        coingecko_api_key=os.getenv("COINGECKO_API_KEY"),
+        volume_db_path=os.getenv(
+            "VOLUME_DB_PATH", str(Path.home() / ".whoop_agent_volume.db")
+        ),
+        chart_output_dir=os.getenv("CHART_OUTPUT_DIR", "./charts"),
     )

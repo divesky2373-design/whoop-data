@@ -11,3 +11,5 @@ build/
 *.log
 .venv/
 venv/
+charts/
+*.db
