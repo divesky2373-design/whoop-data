@@ -174,54 +174,54 @@ def changes():
 
 @volume.command()
 @click.option("--days", default=30, help="Number of days of history (default: 30)")
-def chart(days):
-    """Generate volume visualization charts from stored data."""
+@click.option("--save", is_flag=True, help="Also save PNG charts to disk")
+def chart(days, save):
+    """Display volume charts in the terminal."""
     vs = load_volume_settings()
     conn = volume_store.init_db(vs.volume_db_path)
 
     try:
         snapshots = volume_store.get_snapshots(conn, days=days)
+        diffs = volume_store.get_daily_changes(conn)
     finally:
         conn.close()
 
     if not snapshots:
-        click.echo("No data yet. Run 'volume fetch' first.")
+        click.echo("No data yet. Run 'volume fetch' or 'volume backfill' first.")
         return
 
-    output_dir = vs.chart_output_dir
-    generated = []
+    # Terminal charts
+    click.echo(volume_chart.text_top_volumes(snapshots[-1]))
 
-    # Latest snapshot bar chart
-    path = volume_chart.chart_top_volumes(snapshots[-1], output_dir)
-    generated.append(path)
-
-    # Aggregate volume trend (needs 2+ snapshots)
     if len(snapshots) >= 2:
-        path = volume_chart.chart_aggregate_volume(snapshots, output_dir)
-        if path:
-            generated.append(path)
+        click.echo(volume_chart.text_aggregate_volume(snapshots))
 
-    # Daily changes chart (needs 2+ snapshots)
-    if len(snapshots) >= 2:
-        conn = volume_store.init_db(vs.volume_db_path)
-        try:
-            diffs = volume_store.get_daily_changes(conn)
-        finally:
-            conn.close()
+    if diffs:
+        click.echo(volume_chart.text_daily_changes(diffs))
+
+    # Optionally save PNGs
+    if save:
+        output_dir = vs.chart_output_dir
+        generated = []
+        generated.append(volume_chart.chart_top_volumes(snapshots[-1], output_dir))
+        if len(snapshots) >= 2:
+            path = volume_chart.chart_aggregate_volume(snapshots, output_dir)
+            if path:
+                generated.append(path)
         if diffs:
             path = volume_chart.chart_daily_changes(diffs, output_dir)
             if path:
                 generated.append(path)
-
-    click.echo(f"Generated {len(generated)} chart(s):")
-    for p in generated:
-        click.echo(f"  {p}")
+        click.echo(f"Saved {len(generated)} PNG chart(s):")
+        for p in generated:
+            click.echo(f"  {p}")
 
 
 @volume.command()
 @click.option("--token", required=True, help="CoinGecko coin ID (e.g. fetch-ai)")
 @click.option("--days", default=30, help="Days of history (default: 30)")
-def track(token, days):
+@click.option("--save", is_flag=True, help="Also save PNG chart to disk")
+def track(token, days, save):
     """Track and chart a specific token's volume history."""
     vs = load_volume_settings()
 
@@ -233,8 +233,11 @@ def track(token, days):
         click.echo(f"No data found for '{token}'. Check the CoinGecko coin ID.")
         return
 
-    path = volume_chart.chart_volume_trend(history, token, vs.chart_output_dir)
-    click.echo(f"Chart saved: {path}")
+    click.echo(volume_chart.text_volume_trend(history, token))
+
+    if save:
+        path = volume_chart.chart_volume_trend(history, token, vs.chart_output_dir)
+        click.echo(f"PNG saved: {path}")
 
 
 @volume.command()
