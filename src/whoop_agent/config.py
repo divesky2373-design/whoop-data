@@ -20,9 +20,10 @@ class Settings:
 
 @dataclass
 class VolumeSettings:
-    """Settings for the AI agent trading volume monitor."""
+    """Settings for the agent-to-agent transaction volume monitor."""
 
-    coingecko_api_key: str | None = None
+    dune_api_key: str | None = None
+    basescan_api_key: str | None = None
     volume_db_path: str = str(Path.home() / ".whoop_agent_volume.db")
     chart_output_dir: str = "./charts"
 
@@ -62,7 +63,8 @@ def load_volume_settings() -> VolumeSettings:
     load_dotenv()
 
     return VolumeSettings(
-        coingecko_api_key=os.getenv("COINGECKO_API_KEY"),
+        dune_api_key=os.getenv("DUNE_API_KEY"),
+        basescan_api_key=os.getenv("BASESCAN_API_KEY"),
         volume_db_path=os.getenv(
             "VOLUME_DB_PATH", str(Path.home() / ".whoop_agent_volume.db")
         ),

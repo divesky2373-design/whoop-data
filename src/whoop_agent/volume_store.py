@@ -1,4 +1,4 @@
-"""Local SQLite storage for AI agent trading volume data."""
+"""Local SQLite storage for agent-to-agent transaction volume data."""
 
 import sqlite3
 from datetime import datetime, timezone
@@ -7,28 +7,36 @@ from pathlib import Path
 DEFAULT_DB_PATH = str(Path.home() / ".whoop_agent_volume.db")
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS daily_snapshots (
+CREATE TABLE IF NOT EXISTS daily_volumes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'dune',
+    tx_count INTEGER NOT NULL DEFAULT 0,
+    volume_usd REAL NOT NULL DEFAULT 0,
+    unique_agents INTEGER DEFAULT 0,
     fetched_at TEXT NOT NULL,
-    UNIQUE(date)
+    UNIQUE(date, source)
 );
 
-CREATE TABLE IF NOT EXISTS token_volumes (
+CREATE TABLE IF NOT EXISTS agent_transfers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    snapshot_id INTEGER NOT NULL,
-    coin_id TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    name TEXT NOT NULL,
-    volume_usd REAL NOT NULL,
-    market_cap REAL,
-    price_usd REAL,
-    price_change_24h_pct REAL,
-    FOREIGN KEY (snapshot_id) REFERENCES daily_snapshots(id)
+    tx_hash TEXT NOT NULL,
+    date TEXT NOT NULL,
+    from_agent TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    value_usd REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'basescan',
+    UNIQUE(tx_hash)
 );
 
-CREATE INDEX IF NOT EXISTS idx_token_coin_snapshot
-    ON token_volumes(coin_id, snapshot_id);
+CREATE TABLE IF NOT EXISTS known_agents (
+    address TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'erc8004'
+);
+
+CREATE INDEX IF NOT EXISTS idx_volumes_date ON daily_volumes(date);
+CREATE INDEX IF NOT EXISTS idx_transfers_date ON agent_transfers(date);
 """
 
 
@@ -40,157 +48,164 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def save_snapshot(conn: sqlite3.Connection, snapshot: dict) -> int:
-    """Save a daily volume snapshot. Returns the snapshot id.
-
-    Args:
-        conn: Database connection.
-        snapshot: Dict with 'date', 'fetched_at', and 'tokens' list.
-
-    Returns:
-        The snapshot row id.
-    """
-    date_str = snapshot["date"]
-    fetched_at = snapshot.get(
-        "fetched_at", datetime.now(timezone.utc).isoformat()
-    )
-
-    cur = conn.execute(
-        "INSERT INTO daily_snapshots (date, fetched_at) VALUES (?, ?) "
-        "ON CONFLICT(date) DO UPDATE SET fetched_at = excluded.fetched_at "
-        "RETURNING id",
-        (date_str, fetched_at),
-    )
-    snapshot_id = cur.fetchone()[0]
-
-    # Clear old token data for this snapshot (in case of re-fetch)
-    conn.execute(
-        "DELETE FROM token_volumes WHERE snapshot_id = ?", (snapshot_id,)
-    )
-
-    for token in snapshot.get("tokens", []):
+def save_daily_volumes(
+    conn: sqlite3.Connection, volumes: list[dict], source: str = "dune"
+) -> int:
+    """Save daily volume records. Returns number of rows saved."""
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for v in volumes:
         conn.execute(
-            "INSERT INTO token_volumes "
-            "(snapshot_id, coin_id, symbol, name, volume_usd, "
-            " market_cap, price_usd, price_change_24h_pct) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO daily_volumes (date, source, tx_count, volume_usd, "
+            "  unique_agents, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(date, source) DO UPDATE SET "
+            "  tx_count=excluded.tx_count, volume_usd=excluded.volume_usd, "
+            "  unique_agents=excluded.unique_agents, fetched_at=excluded.fetched_at",
             (
-                snapshot_id,
-                token["coin_id"],
-                token["symbol"],
-                token["name"],
-                token["volume_usd"],
-                token.get("market_cap"),
-                token.get("price_usd"),
-                token.get("price_change_24h_pct"),
+                v["date"],
+                source,
+                v.get("tx_count", 0),
+                v.get("volume_usd", 0),
+                v.get("unique_agents", 0),
+                now,
             ),
         )
-
+        count += 1
     conn.commit()
-    return snapshot_id
+    return count
 
 
-def get_snapshots(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
-    """Get the last N days of snapshots with token data."""
-    rows = conn.execute(
-        "SELECT id, date, fetched_at FROM daily_snapshots "
-        "ORDER BY date DESC LIMIT ?",
-        (days,),
-    ).fetchall()
+def save_transfers(
+    conn: sqlite3.Connection, transfers: list[dict], source: str = "basescan"
+) -> int:
+    """Save agent-to-agent transfer records. Returns count saved."""
+    count = 0
+    for tx in transfers:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_transfers "
+                "(tx_hash, date, from_agent, to_agent, value_usd, source) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    tx["tx_hash"],
+                    tx["date"],
+                    tx.get("from_agent", tx.get("from", "")),
+                    tx.get("to_agent", tx.get("to", "")),
+                    tx["value_usd"] if "value_usd" in tx else tx.get("value_usdc", 0),
+                    source,
+                ),
+            )
+            count += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    return count
 
-    results = []
-    for row in rows:
-        tokens = conn.execute(
-            "SELECT coin_id, symbol, name, volume_usd, market_cap, "
-            "       price_usd, price_change_24h_pct "
-            "FROM token_volumes WHERE snapshot_id = ? "
-            "ORDER BY volume_usd DESC",
-            (row["id"],),
-        ).fetchall()
 
-        results.append({
-            "date": row["date"],
-            "fetched_at": row["fetched_at"],
-            "tokens": [dict(t) for t in tokens],
-        })
+def save_agents(conn: sqlite3.Connection, addresses: list[str]) -> int:
+    """Save known agent addresses. Returns count of new agents."""
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for addr in addresses:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO known_agents (address, first_seen, source) "
+                "VALUES (?, ?, 'erc8004')",
+                (addr.lower(), now),
+            )
+            count += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    return count
 
-    return list(reversed(results))  # chronological order
 
-
-def get_token_history(
-    conn: sqlite3.Connection, coin_id: str, days: int = 30
+def get_daily_volumes(
+    conn: sqlite3.Connection, days: int = 30, source: str | None = None
 ) -> list[dict]:
-    """Get volume history for a specific token over N days."""
-    rows = conn.execute(
-        "SELECT s.date, t.volume_usd, t.price_usd, t.market_cap, "
-        "       t.price_change_24h_pct "
-        "FROM token_volumes t "
-        "JOIN daily_snapshots s ON t.snapshot_id = s.id "
-        "WHERE t.coin_id = ? "
-        "ORDER BY s.date DESC LIMIT ?",
-        (coin_id, days),
-    ).fetchall()
-
+    """Get daily volume records, most recent first then reversed."""
+    if source:
+        rows = conn.execute(
+            "SELECT date, tx_count, volume_usd, unique_agents, source "
+            "FROM daily_volumes WHERE source = ? "
+            "ORDER BY date DESC LIMIT ?",
+            (source, days),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT date, SUM(tx_count) as tx_count, SUM(volume_usd) as volume_usd, "
+            "  MAX(unique_agents) as unique_agents, GROUP_CONCAT(DISTINCT source) as source "
+            "FROM daily_volumes GROUP BY date "
+            "ORDER BY date DESC LIMIT ?",
+            (days,),
+        ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
 def get_daily_changes(conn: sqlite3.Connection) -> list[dict]:
-    """Compare the latest snapshot to the previous one.
+    """Compare latest two days of volume data.
 
-    Returns list of dicts with coin_id, symbol, today_volume,
-    yesterday_volume, and change_pct.
+    Returns list with one entry containing today/yesterday comparison.
     """
-    snapshots = conn.execute(
-        "SELECT id, date FROM daily_snapshots ORDER BY date DESC LIMIT 2"
+    rows = conn.execute(
+        "SELECT date, SUM(tx_count) as tx_count, SUM(volume_usd) as volume_usd "
+        "FROM daily_volumes GROUP BY date ORDER BY date DESC LIMIT 2"
     ).fetchall()
 
-    if len(snapshots) < 2:
+    if len(rows) < 2:
         return []
 
-    today_id, yesterday_id = snapshots[0]["id"], snapshots[1]["id"]
+    today, yesterday = dict(rows[0]), dict(rows[1])
+    yv = yesterday["volume_usd"]
+    tv = today["volume_usd"]
+    vol_pct = ((tv - yv) / yv * 100) if yv > 0 else None
 
-    today_tokens = {
-        r["coin_id"]: dict(r)
-        for r in conn.execute(
-            "SELECT coin_id, symbol, name, volume_usd "
-            "FROM token_volumes WHERE snapshot_id = ?",
-            (today_id,),
-        ).fetchall()
-    }
+    ytc = yesterday["tx_count"]
+    ttc = today["tx_count"]
+    tx_pct = ((ttc - ytc) / ytc * 100) if ytc > 0 else None
 
-    yesterday_tokens = {
-        r["coin_id"]: dict(r)
-        for r in conn.execute(
-            "SELECT coin_id, symbol, name, volume_usd "
-            "FROM token_volumes WHERE snapshot_id = ?",
-            (yesterday_id,),
-        ).fetchall()
-    }
-
-    changes = []
-    for coin_id, today in today_tokens.items():
-        yesterday = yesterday_tokens.get(coin_id)
-        yv = yesterday["volume_usd"] if yesterday else 0
-        tv = today["volume_usd"]
-        pct = ((tv - yv) / yv * 100) if yv > 0 else None
-
-        changes.append({
-            "coin_id": coin_id,
-            "symbol": today["symbol"],
-            "name": today["name"],
-            "today_volume": tv,
-            "yesterday_volume": yv,
-            "change_pct": round(pct, 2) if pct is not None else None,
-        })
-
-    changes.sort(key=lambda x: x["today_volume"], reverse=True)
-    return changes
+    return [{
+        "today_date": today["date"],
+        "yesterday_date": yesterday["date"],
+        "today_volume": tv,
+        "yesterday_volume": yv,
+        "volume_change_pct": round(vol_pct, 2) if vol_pct is not None else None,
+        "today_tx_count": ttc,
+        "yesterday_tx_count": ytc,
+        "tx_count_change_pct": round(tx_pct, 2) if tx_pct is not None else None,
+    }]
 
 
-def list_tracked_tokens(conn: sqlite3.Connection) -> list[dict]:
-    """List all unique tokens that have been tracked."""
+def get_recent_transfers(
+    conn: sqlite3.Connection, limit: int = 20
+) -> list[dict]:
+    """Get most recent agent-to-agent transfers."""
     rows = conn.execute(
-        "SELECT DISTINCT coin_id, symbol, name FROM token_volumes "
-        "ORDER BY symbol"
+        "SELECT tx_hash, date, from_agent, to_agent, value_usd, source "
+        "FROM agent_transfers ORDER BY date DESC, id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_top_agent_pairs(
+    conn: sqlite3.Connection, days: int = 30
+) -> list[dict]:
+    """Get top agent pairs by transaction value."""
+    rows = conn.execute(
+        "SELECT from_agent, to_agent, COUNT(*) as tx_count, "
+        "  SUM(value_usd) as total_value "
+        "FROM agent_transfers "
+        "WHERE date >= date('now', ? || ' days') "
+        "GROUP BY from_agent, to_agent "
+        "ORDER BY total_value DESC LIMIT 20",
+        (f"-{days}",),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_agent_count(conn: sqlite3.Connection) -> int:
+    """Get total number of known agents."""
+    row = conn.execute("SELECT COUNT(*) as cnt FROM known_agents").fetchone()
+    return row["cnt"] if row else 0
